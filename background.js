@@ -3,6 +3,114 @@ const GEMINI_API_KEY = 'YOUR_GEMINI_API_KEY_HERE'; // https://aistudio.google.co
 console.log('🚀 Background.js 로드 완료!');
 console.log('📅 시작 시간:', new Date().toLocaleString('ko-KR'));
 
+// ===== RAG: 법률 지식베이스 로드 및 검색 =====
+let lawKB = null;
+let lawKBLoaded = false;
+
+// 법률 지식베이스 로드
+async function loadLawKB() {
+  if (lawKBLoaded) return lawKB;
+  
+  try {
+    const response = await fetch(chrome.runtime.getURL('law_kb.json'));
+    lawKB = await response.json();
+    lawKBLoaded = true;
+    console.log(`📚 법률 지식베이스 로드 완료: ${lawKB.length}개 조항`);
+    return lawKB;
+  } catch (error) {
+    console.error('❌ 법률 지식베이스 로드 실패:', error);
+    return [];
+  }
+}
+
+// 약관 텍스트와 법률 조항 간 유사도 계산
+function calculateRelevance(termText, lawItem) {
+  let score = 0;
+  const lowerTerm = termText.toLowerCase();
+  const lowerTitle = (lawItem.title || '').toLowerCase();
+  const lowerSnippet = (lawItem.snippet || '').toLowerCase();
+  const lowerCategory = (lawItem.category || '').toLowerCase();
+  
+  // 카테고리 매칭 (높은 가중치)
+  const termType = detectTermsCategory(termText);
+  if (termType === lawItem.category) {
+    score += 30;
+  }
+  
+  // 제목 키워드 매칭
+  const titleKeywords = lowerTitle.split(/\s+/);
+  titleKeywords.forEach(keyword => {
+    if (keyword.length > 2 && lowerTerm.includes(keyword)) {
+      score += 10;
+    }
+  });
+  
+  // 스니펫 키워드 매칭 (핵심 용어들)
+  const keyTerms = ['수집', '이용', '제공', '동의', '고지', '목적', '제3자', '개인정보', 
+                     '환불', '철회', '해지', '위약금', '책임', '면책', '마케팅', '광고'];
+  keyTerms.forEach(term => {
+    if (lowerSnippet.includes(term) && lowerTerm.includes(term)) {
+      score += 5;
+    }
+  });
+  
+  // 법률 조항 ID 매칭 (특정 법률 항목)
+  const lawKeywords = [
+    { pattern: /개인정보.*수집|수집.*개인정보/i, lawIds: ['P1', 'P2', 'P3'] },
+    { pattern: /제3자.*제공|제공.*제3자/i, lawIds: ['P4', 'TP1', 'TP3'] },
+    { pattern: /환불|철회|반품/i, lawIds: ['T1', 'T2'] },
+    { pattern: /마케팅|광고/i, lawIds: ['M1', 'M2', 'M6'] },
+    { pattern: /위약금|손해배상/i, lawIds: ['T4'] }
+  ];
+  
+  lawKeywords.forEach(({ pattern, lawIds }) => {
+    if (pattern.test(termText) && lawIds.includes(lawItem.id)) {
+      score += 20;
+    }
+  });
+  
+  // weight 적용
+  return score * (lawItem.weight || 1.0);
+}
+
+// 약관 카테고리 자동 감지
+function detectTermsCategory(termText) {
+  const lower = termText.toLowerCase();
+  if (lower.includes('개인정보') || lower.includes('privacy')) return 'privacy';
+  if (lower.includes('마케팅') || lower.includes('marketing') || lower.includes('광고')) return 'marketing';
+  if (lower.includes('제3자') || lower.includes('third party')) return 'third-party';
+  return 'terms';
+}
+
+// RAG: 관련 법률 조항 검색 (상위 N개)
+async function searchRelevantLaws(termText, limit = 5) {
+  if (!lawKBLoaded) {
+    await loadLawKB();
+  }
+  
+  if (!lawKB || lawKB.length === 0) {
+    console.warn('⚠️ 법률 지식베이스가 비어있음');
+    return [];
+  }
+  
+  // 모든 조항에 대해 유사도 계산
+  const scoredLaws = lawKB.map(law => ({
+    law: law,
+    score: calculateRelevance(termText, law)
+  }));
+  
+  // 점수순 정렬 및 상위 N개 선택
+  const topLaws = scoredLaws
+    .sort((a, b) => b.score - a.score)
+    .filter(item => item.score > 0)
+    .slice(0, limit)
+    .map(item => item.law);
+  
+  console.log(`🔍 관련 법률 조항 검색: ${topLaws.length}개 발견 (최고 점수: ${scoredLaws[0]?.score || 0})`);
+  
+  return topLaws;
+}
+
 // 메시지 리스너
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log('📨 메시지 수신:', request.action, 'from tab:', sender.tab?.id);
@@ -73,20 +181,44 @@ async function analyzeTermsWithGemini(terms, url, tabId) {
     console.log('🔄 Gemini API 분석 시작...', { termsCount: terms.length, url });
     const startTime = performance.now();
 
+    // ===== RAG: 법률 지식베이스 로드 =====
+    await loadLawKB();
+
     // ===== 최적화 1: 약관 텍스트 요약 =====
     const summarized = summarizeTerms(terms);
     const totalLength = summarized.reduce((sum, t) => sum + t.text.length, 0);
     console.log(`📊 텍스트 크기: ${totalLength.toLocaleString()}자`);
 
-    // ===== 최적화 2: 체크박스별 개별 분석 프롬프트 =====
+    // ===== RAG: 각 약관에 대한 관련 법률 조항 검색 및 수집 =====
+    const allRelevantLaws = new Map(); // 중복 제거를 위해 Map 사용
+    
+    for (const term of summarized) {
+      const relevantLaws = await searchRelevantLaws(term.text, 5);
+      relevantLaws.forEach(law => {
+        allRelevantLaws.set(law.id, law); // ID를 키로 사용하여 중복 제거
+      });
+    }
+    
+    const uniqueLaws = Array.from(allRelevantLaws.values());
+    console.log(`📚 총 ${uniqueLaws.length}개의 고유 법률 조항 수집됨`);
+
+    // ===== 법률 조항을 프롬프트 형식으로 포맷팅 =====
+    const lawsContext = uniqueLaws.map(law => 
+      `[${law.id}] ${law.title}\n법률: ${law.law} ${law.article}\n내용: ${law.snippet}`
+    ).join('\n\n');
+
+    // ===== 최적화 2: 체크박스별 개별 분석 프롬프트 (RAG 컨텍스트 포함) =====
     const termsText = summarized.map(t =>
       `[${t.index}. ${t.type}${t.isRequired ? ' 필수' : ''}]\n${t.text}`
     ).join('\n\n---\n\n');
 
     const prompt = `다음 약관들을 분석하여 유효한 JSON 배열로만 답변하세요. 설명이나 마크다운 없이 순수 JSON만 출력하세요.
 
-약관:
-${termsText}
+약관: ${termsText}
+
+관련 법률 조항 (판단 기준): ${lawsContext || '관련 법률 조항 없음'}
+
+분석 지침: 위의 법률 조항을 기준으로 각 약관이 법적 요건을 충족하는지, 부당한 조항이 포함되어 있는지 판단하세요.
 
 출력 형식 (각 약관마다):
 [

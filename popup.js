@@ -23,6 +23,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     console.log('저장된 분석:', analysis);
     console.log('현재 배지:', badgeText);
 
+    // 약관이 없으면 팝업 닫기
+    if (!analysis && !badgeText) {
+      window.close();
+      return;
+    }
+
+    
     // 상태 판단 로직
     if (badgeText === '분석중' || badgeText === '분석 중' || badgeText === 'analyzing') {
       // 분석 중 상태
